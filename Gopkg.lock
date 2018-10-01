@@ -156,6 +156,7 @@
   analyzer-version = 1
   input-imports = [
     "github.com/spf13/viper",
+    "gopkg.in/square/go-jose.v2",
     "gopkg.in/square/go-jose.v2/jwt",
   ]
   solver-name = "gps-cdcl"

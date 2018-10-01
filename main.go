@@ -2,16 +2,26 @@ package main
 
 import (
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"time"
 
 	"github.com/spf13/viper"
+	"gopkg.in/square/go-jose.v2"
 	"gopkg.in/square/go-jose.v2/jwt"
 )
 
 type Config struct {
-	Token   string    `json:"token"`
-	Issuers []*Issuer `json:"issuers"`
+	Token      string                 `json:"token"`
+	Claims     map[string]interface{} `json:"claims"`
+	SigningKey jose.SigningKey
+	Issuers    []*Issuer `json:"issuers"`
+}
+
+type Secrets struct {
+	Algorithm  string `json:"algorithm"`
+	PrivateKey string `json:"privateKey"`
 }
 
 type Issuer struct {
@@ -27,19 +37,47 @@ func main() {
 }
 
 func mainE() error {
-	viper.SetConfigName("config")
-	viper.AddConfigPath(".")
+	viperConfig := viper.New()
+	viperConfig.SetConfigName("config")
+	viperConfig.AddConfigPath(".")
 
-	err := viper.ReadInConfig()
+	err := viperConfig.ReadInConfig()
 	if err != nil {
 		return fmt.Errorf("failed to read config: %s", err)
 	}
 
 	var config Config
-	err = viper.Unmarshal(&config)
+	err = viperConfig.Unmarshal(&config)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal config: %s", err)
 	}
+
+	viperSecrets := viper.New()
+	viperSecrets.SetConfigName("secrets")
+	viperSecrets.AddConfigPath(".")
+
+	err = viperSecrets.ReadInConfig()
+	if err != nil {
+		return fmt.Errorf("failed to read secrets: %s", err)
+	}
+
+	var secrets Secrets
+	err = viperSecrets.Unmarshal(&secrets)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal secrets: %s", err)
+	}
+
+	err = config.loadSigningKey(&secrets)
+	if err != nil {
+		return err
+	}
+
+	signedToken, err := config.issueToken()
+	if err != nil {
+		return fmt.Errorf("failed to sign token: %s", err)
+	}
+
+	fmt.Printf("Signed token: %s\n", signedToken)
 
 	for _, issuer := range config.Issuers {
 		err := issuer.parsePublicKey()
@@ -61,18 +99,63 @@ func mainE() error {
 	return fmt.Errorf("failed to validate token")
 }
 
+func (config *Config) loadSigningKey(secrets *Secrets) error {
+	block, _ := pem.Decode([]byte(secrets.PrivateKey))
+	if block == nil {
+		return fmt.Errorf("failed to read PEM block for private key")
+	}
+
+	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("failed to parse private key: %s", err)
+	}
+
+	jsonWebKey := jose.JSONWebKey{
+		Key:          key,
+		Certificates: []*x509.Certificate{},
+		KeyID:        "token-swap",
+		Algorithm:    secrets.Algorithm,
+		Use:          "some use",
+	}
+
+	config.SigningKey = jose.SigningKey{
+		Key:       key,
+		Algorithm: jose.SignatureAlgorithm(jsonWebKey.Algorithm),
+	}
+	return nil
+}
+
+func (config *Config) issueToken() (string, error) {
+	signer, err := jose.NewSigner(config.SigningKey, &jose.SignerOptions{})
+	if err != nil {
+		return "", fmt.Errorf("failed to get signer: %s", err)
+	}
+
+	payload, err := json.Marshal(config.Claims)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal claims: %s", err)
+	}
+
+	signature, err := signer.Sign(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to sign payload: %s", err)
+	}
+
+	return signature.CompactSerialize()
+}
+
 func (issuer *Issuer) parsePublicKey() error {
 	block, _ := pem.Decode([]byte(issuer.PublicKey))
 	if block == nil {
 		return fmt.Errorf("failed to read PEM block for issuer '%s'", issuer.Issuer)
 	}
 
-	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	key, err := x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {
 		return fmt.Errorf("failed to parse public key for issuer '%s': %s", issuer.Issuer, err)
 	}
 
-	issuer.ParsedPublicKey = pub
+	issuer.ParsedPublicKey = key
 	return nil
 }
 
@@ -93,7 +176,7 @@ func (issuer *Issuer) getClaims(tokenString string) (map[string]interface{}, err
 
 	expected := jwt.Expected{
 		Issuer: issuer.Issuer,
-		//Time:   time.Now(),
+		Time:   time.Now(),
 	}
 	if err := publicClaims.Validate(expected); err != nil {
 		return nil, fmt.Errorf("failed to validate public claims: %s", err)
