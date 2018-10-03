@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"net/http"
+	"strings"
 	"time"
 
 	dex "github.com/dexidp/dex/storage/kubernetes"
@@ -99,17 +101,8 @@ func mainE() error {
 		}
 	}
 
-	newClaims, err := config.validateToken(config.Token)
-	if err != nil {
-		return err
-	}
-
-	signedToken, err := config.issueToken(newClaims)
-	if err != nil {
-		return fmt.Errorf("failed to sign token: %s", err)
-	}
-
-	config.Logger.Infof("Signed token: %s\n", signedToken)
+	http.HandleFunc("/", config.handler)
+	config.Logger.Fatal(http.ListenAndServe(":8080", nil))
 
 	return nil
 }
@@ -309,5 +302,46 @@ func prefixClaim(prefix string, claim interface{}) (interface{}, error) {
 		return array, nil
 	default:
 		return nil, fmt.Errorf("claim must be string or array of strings (%+v)\n", claim)
+	}
+}
+
+func (config *Config) handler(w http.ResponseWriter, r *http.Request) {
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, err := w.Write([]byte("Bearer token must be set in authorization header\n"))
+		if err != nil {
+			config.Logger.Errorf("Failed to write error to response body: %s", err)
+		}
+		return
+	}
+
+	token := strings.TrimPrefix(auth, "Bearer ")
+	claims, err := config.validateToken(token)
+	if err != nil {
+		config.Logger.Infof("Rejected token")
+		w.WriteHeader(http.StatusForbidden)
+		_, err := w.Write([]byte(err.Error() + "\n"))
+		if err != nil {
+			config.Logger.Errorf("Failed to write error to response body: %s", err)
+		}
+		return
+	}
+
+	signedToken, err := config.issueToken(claims)
+	if err != nil {
+		config.Logger.Errorf("failed to sign token: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, err := w.Write([]byte("Failed to sign token\n"))
+		if err != nil {
+			config.Logger.Errorf("Failed to write error to response body: %s", err)
+		}
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_, err = w.Write([]byte(signedToken + "\n"))
+	if err != nil {
+		config.Logger.Errorf("Failed to write token to response body: %s", err)
 	}
 }
