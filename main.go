@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"time"
 
+	dex "github.com/dexidp/dex/storage/kubernetes"
+	log "github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	"gopkg.in/square/go-jose.v2"
 	"gopkg.in/square/go-jose.v2/jwt"
@@ -14,9 +16,11 @@ import (
 
 type Config struct {
 	Token      string                 `json:"token"`
+	DexSigner  bool                   `json:"dexSigner"`
 	Claims     map[string]interface{} `json:"claims"`
+	Issuers    []*Issuer              `json:"issuers"`
 	SigningKey jose.SigningKey
-	Issuers    []*Issuer `json:"issuers"`
+	Logger     *log.Logger
 }
 
 type Issuer struct {
@@ -54,6 +58,8 @@ func mainE() error {
 	}
 
 	var config Config
+	config.Logger = log.New()
+
 	err = viperConfig.Unmarshal(&config)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal config: %s", err)
@@ -74,9 +80,16 @@ func mainE() error {
 		return fmt.Errorf("failed to unmarshal secrets: %s", err)
 	}
 
-	err = config.loadSigningKey(&secrets)
-	if err != nil {
-		return err
+	if config.DexSigner {
+		err = config.loadDexSigningKey()
+		if err != nil {
+			return fmt.Errorf("failed to load Dex signing key: %s", err)
+		}
+	} else {
+		err = config.loadSigningKey(&secrets)
+		if err != nil {
+			return fmt.Errorf("failed to load signing key from config: %s", err)
+		}
 	}
 
 	for _, issuer := range config.Issuers {
@@ -96,7 +109,7 @@ func mainE() error {
 		return fmt.Errorf("failed to sign token: %s", err)
 	}
 
-	fmt.Printf("Signed token: %s\n", signedToken)
+	config.Logger.Infof("Signed token: %s\n", signedToken)
 
 	return nil
 }
@@ -127,6 +140,30 @@ func (config *Config) loadSigningKey(secrets *Secrets) error {
 	return nil
 }
 
+func (config *Config) loadDexSigningKey() error {
+	dexConfig := dex.Config{
+		InCluster: true,
+		UseTPR:    false,
+	}
+
+	storage, err := dexConfig.Open(config.Logger)
+	if err != nil {
+		return err
+	}
+
+	keys, err := storage.GetKeys()
+	if err != nil {
+		return err
+	}
+
+	config.SigningKey = jose.SigningKey{
+		Key:       keys.SigningKey.Key,
+		Algorithm: jose.SignatureAlgorithm(keys.SigningKey.Algorithm),
+	}
+
+	return nil
+}
+
 func (config *Config) validateToken(token string) (map[string]interface{}, error) {
 	expectedIssuer, err := getIssuer(token)
 	if err != nil {
@@ -137,17 +174,14 @@ func (config *Config) validateToken(token string) (map[string]interface{}, error
 		if issuer.Issuer == expectedIssuer {
 			claims, err := issuer.getClaims(token)
 			if err != nil {
-				return nil, fmt.Errorf("validation for issuer '%s' failed: %s", expectedIssuer, err)
+				return nil, fmt.Errorf("validation for issuer %s failed: %s", issuer.Issuer, err)
 			} else {
-				fmt.Printf("Validated claims: %+v\n", claims)
+				config.Logger.Infof("Validated claims for issuer %s: %+v\n", issuer.Issuer, claims)
 
 				newClaims, err := issuer.mapClaims(claims)
 				if err != nil {
 					return nil, err
 				}
-
-				fmt.Printf("Original claims: %+v\n", claims)
-				fmt.Printf("Mapped claims: %+v\n", newClaims)
 
 				return newClaims, nil
 			}
